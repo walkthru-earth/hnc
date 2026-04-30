@@ -23,6 +23,8 @@ def write_geoparquet_v2(
     bbox: BBox | None = None,
 ) -> Path:
     con.execute("INSTALL spatial; LOAD spatial;")
+    # Lock lon/lat axis order across the session, the default flips in DuckDB 2.1.
+    con.execute("SET geometry_always_xy = true;")
 
     where_clauses = ["c.image_id <> '__sentinel__'"]
     if bbox is not None:
@@ -43,7 +45,7 @@ def write_geoparquet_v2(
             c.captured_at,
             c.compass_angle,
             c.camera_type,
-            ST_Point(c.lon, c.lat) AS geom,
+            ST_SetCRS(ST_Point(c.lon, c.lat), 'OGC:CRS84') AS geom,
             inf.brain_activity,
             inf.top_regions
         FROM read_parquet('{cache_glob}', union_by_name=true) c
