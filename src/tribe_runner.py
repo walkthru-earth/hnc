@@ -40,6 +40,12 @@ class TribeRunner:
             cache_folder=self.cache_folder,
             device=self.device,
         )
+        # TRIBE v2 was trained on naturalistic video with speech. The
+        # default predict() drops segments whose ns_events list is empty,
+        # which can wipe out predictions for our silent static clips.
+        # Force-keep every TR so visual-cortex activations survive even
+        # when no words are transcribed.
+        self.model.remove_empty_segments = False
 
     def predict_clip(self, video_path: Path) -> tuple[np.ndarray, list]:
         if self.model is None:

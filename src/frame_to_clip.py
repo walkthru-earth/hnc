@@ -9,9 +9,12 @@ def jpeg_to_static_clip(
     jpeg_bytes: bytes,
     out_path: Path,
     *,
-    n_frames: int = 64,
+    n_frames: int = 480,
     fps: int = 16,
 ) -> Path:
+    # 480 frames at 16 fps == 30 s, matching TRIBE v2's video chunker
+    # (ChunkEvents min_duration=30 s, max_duration=60 s). Shorter clips
+    # are dropped or merged by upstream and produce zero predictions.
     import io
 
     import imageio
