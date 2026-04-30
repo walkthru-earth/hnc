@@ -37,7 +37,7 @@ flowchart LR
     C -->|new ids only<br/>API hit minimized| D[Resolve thumb_2048_url<br/>+ download JPEG bytes]
     C -->|already cached| E[Skip download,<br/>load BLOB from existing shard]
     D --> F[Append rows to<br/>cache_part_<ts>.parquet<br/>BLOB + lon/lat/compass/captured_at]
-    F --> G[Frame replicator<br/>1 still → 4 s 64-frame MP4]
+    F --> G[Frame replicator<br/>1 still → 30 s 480-frame MP4 @ 16 fps]
     E --> G
     G --> H[TRIBE v2<br/>video-only mode<br/>vjepa2-vitg-fpc64-256]
     H --> I[preds, n_segments × 20484<br/>cortical activity]
@@ -53,8 +53,9 @@ Three storage artifacts live side by side,
 | Artifact | Purpose | Schema | Size at 5k images |
 |---|---|---|---|
 | `cache_images/cache_part_*.parquet` | append-only **inline-BLOB** cache, one shard per session, the only place pixels live | id, **blob**, sha256, mime, bytes, w, h, lon, lat, compass, **captured_at**, camera_type, is_pano, sequence_id, creator_id, downloaded_at | ~2 GB |
+| `cache_inference/cache_part_*.parquet` | append-only inference-result cache, makes mid-batch crashes recoverable, lets re-runs skip the encode+predict path on a cache hit | image_id, brain_activity (FLOAT[]), top_regions (STRUCT[]), inferred_at, model_repo | ~50 MB zstd |
 | `cache_index.parquet` | skinny dedup index, scanned every run | image_id, downloaded_at, sha256, byte_size, source_parquet | ~10 MB |
-| `london_aoi.parquet` | the GeoParquet 2.0 deliverable, regenerated per run | id, blob, mime, captured_at, compass, camera, geom, brain_activity, top_regions | ~1.5 GB zstd |
+| `london_aoi.parquet` | the GeoParquet 2.0 deliverable, regenerated per run, `geom` is `GEOMETRY('OGC:CRS84')` | id, blob, mime, captured_at, compass, camera, geom, brain_activity, top_regions | ~1.5 GB zstd |
 
 ---
 
@@ -98,6 +99,9 @@ curl -sG "https://graph.mapillary.com/images" \
 
 ## 3. Mapillary Graph API, the only endpoints we use
 
+> **Field-name correction.** The Image entity API documents `creator{id, username}` as a nested object, not the flat `creator_id` originally used in this plan. `creator_id` only appears under the *coverage tiles* section and may return `null` when requested from `/images`. The client now requests `creator` and parses `.creator.id`, with a fallback to `creator_id` for any older sequence-search responses.
+
+
 **Auth**, the long-lived `Access Token` from the developer portal is sufficient for read-only image and metadata access. Header form is `Authorization: OAuth <TOKEN>` (literal word `OAuth`, not `Bearer`).
 
 **Bounding-box search**,
@@ -106,7 +110,7 @@ curl -sG "https://graph.mapillary.com/images" \
 curl -G "https://graph.mapillary.com/images" \
   -H "Authorization: OAuth $MLY_TOKEN" \
   --data-urlencode "bbox=-0.146500,51.540500,-0.142200,51.543000" \
-  --data-urlencode "fields=id,captured_at,computed_geometry,computed_compass_angle,camera_type,is_pano,sequence,creator_id,thumb_2048_url" \
+  --data-urlencode "fields=id,captured_at,computed_geometry,computed_compass_angle,camera_type,is_pano,sequence,creator,thumb_2048_url" \
   --data-urlencode "start_captured_at=2023-04-30T00:00:00Z" \
   --data-urlencode "limit=2000"
 ```
@@ -269,9 +273,10 @@ flowchart LR
 - Weights, `facebook/tribev2/best.ckpt`, 676 MB, fp32, no bf16 / fp16 / quantized variant on HF.
 - Vision-only mode is supported via `modality_dropout=0.3` training, set `features_to_mask=["text","audio"]` or just provide no audio / text. Llama gating is then irrelevant.
 - Subject Block, `from_pretrained` forces `average_subjects = True`, predictions are zero-shot for a generic viewer.
-- Output, `preds` is `(n_segments, 20484)` cortical activity at 1 Hz, shifted -5 s for hemodynamic lag. `n_segments` is the number of TRs (1 s each) extracted from the 4 s clip.
+- Output, `preds` is `(n_segments, 20484)` cortical activity at 1 Hz, shifted -5 s for hemodynamic lag. `n_segments` is the number of TRs (1 s each) extracted from the clip.
+- **`remove_empty_segments = False`**, the runner overrides the upstream default after `from_pretrained`. The default drops segments whose `ns_events` list is empty, which on a silent static clip wipes out the whole prediction. Forcing `False` keeps every TR so visual-cortex activations survive.
 
-**Single-image trick.** V-JEPA 2 expects a 4 s, 64-frame clip per 2 Hz time bin. There is no single-image entry point. We replicate one Mapillary still 64 times into a 4-second MP4 at 16 fps and feed `video_path=...`. Caveat, V-JEPA 2 was trained on real motion, motion-area (MT/V5) responses on a static clip will be attenuated, ventral-stream responses (FFA / PPA / EBA / VWFA / V1) are well-supported by paper Fig 4 in-silico IBC localizers, which themselves used 1 s flashed images.
+**Single-image trick.** V-JEPA 2 expects a video clip per 2 Hz time bin. There is no single-image entry point. We replicate one Mapillary still **480 times into a 30-second MP4 at 16 fps** (`src/frame_to_clip.py::jpeg_to_static_clip`) and feed `video_path=...`. The 30 s length matches TRIBE's `ChunkEvents min_duration=30 s, max_duration=60 s` window, shorter clips are dropped or merged by the upstream chunker and produce zero predictions. Caveat, V-JEPA 2 was trained on real motion, motion-area (MT/V5) responses on a static clip will be attenuated, ventral-stream responses (FFA / PPA / EBA / VWFA / V1) are well-supported by paper Fig 4 in-silico IBC localizers, which themselves used 1 s flashed images.
 
 **Minimal inference snippet (verbatim from repo README)**,
 
@@ -307,6 +312,7 @@ Top-K functional ROIs we surface per image (alias-mapped from HCP MMP1 parcels v
 
 DuckDB core's Parquet writer accepts `GEOPARQUET_VERSION` directly. Verified values from `duckdb/duckdb` `test/geoparquet/versions.test`,
 
+
 | Value | `geo` metadata | Native Parquet `GEOMETRY` logical type |
 |---|---|---|
 | omitted (default) | `1.0.0` (WKB) | no |
@@ -329,36 +335,43 @@ CREATE OR REPLACE TABLE mapillary_london (
   captured_at     TIMESTAMP,
   compass_angle   DOUBLE,
   camera_type     VARCHAR,
-  geom            GEOMETRY,                              -- POINT(lon lat) in CRS84
+  geom            GEOMETRY('OGC:CRS84'),                 -- POINT(lon lat), CRS attached via ST_SetCRS
   brain_activity  FLOAT[],                               -- 360-d ROI mean vector
   top_regions     STRUCT(name VARCHAR, score FLOAT)[]    -- top-K per image
 );
 ```
 
-**Insert (joined cache + inference),**
+**CRS, the v1.5 typed-column way.** DuckDB 1.5 made `GEOMETRY` a core type that carries an optional CRS as part of its column type. We attach **`OGC:CRS84`** explicitly via `ST_SetCRS` so the deliverable advertises its CRS in three places at once,
+
+1. The Parquet logical type, `GeometryType(crs={...PROJJSON for OGC:CRS84...})`.
+2. The `geo` KV metadata under `columns.geom.crs` (PROJJSON form).
+3. The DuckDB column type on read-back, `GEOMETRY('OGC:CRS84')`.
+
+Without `ST_SetCRS` the column is still a valid GeoParquet V2 (the spec defaults missing `crs` to OGC:CRS84), but the CRS stays implicit. Making it explicit avoids surprises in downstream tools that don't apply the spec default. We also pin `SET geometry_always_xy = true` on the writer session so lon/lat axis order survives the DuckDB 2.1 default flip.
+
+**Insert + native write, joined cache + inference, no GDAL,** (verbatim from `src/geoparquet_writer.py::write_geoparquet_v2`),
 
 ```sql
-INSERT INTO mapillary_london
-SELECT
-  c.image_id,
-  c.image_blob,
-  c.image_mime,
-  c.captured_at,
-  c.compass_angle,
-  c.camera_type,
-  ST_Point(c.lon, c.lat) AS geom,
-  inf.brain_activity,
-  inf.top_regions
-FROM read_parquet('cache_images/cache_part_*.parquet', union_by_name=true) c
-JOIN inference_results inf USING (image_id)
-WHERE c.lon BETWEEN -0.1465 AND -0.1422
-  AND c.lat BETWEEN  51.5405 AND  51.5430;
-```
+INSTALL spatial; LOAD spatial;
+SET geometry_always_xy = true;
 
-**Native GeoParquet 2.0 write, no GDAL,**
-
-```sql
-COPY (SELECT * FROM mapillary_london) TO 'london_aoi.parquet' (
+COPY (
+  SELECT
+    c.image_id,
+    c.image_blob,
+    c.image_mime,
+    c.captured_at,
+    c.compass_angle,
+    c.camera_type,
+    ST_SetCRS(ST_Point(c.lon, c.lat), 'OGC:CRS84') AS geom,
+    inf.brain_activity,
+    inf.top_regions
+  FROM read_parquet('cache_images/cache_part_*.parquet', union_by_name=true) c
+  JOIN inference_results inf USING (image_id)
+  WHERE c.image_id <> '__sentinel__'
+    AND c.lon BETWEEN -0.1465 AND -0.1422
+    AND c.lat BETWEEN  51.5405 AND  51.5430
+) TO 'london_aoi.parquet' (
   FORMAT PARQUET,
   GEOPARQUET_VERSION 'V2',
   COMPRESSION 'ZSTD',
@@ -371,18 +384,25 @@ COPY (SELECT * FROM mapillary_london) TO 'london_aoi.parquet' (
 
 ```sql
 LOAD spatial;
-SELECT image_id, ST_AsText(geom) AS wkt, length(image_blob) AS bytes
+SET geometry_always_xy = true;
+
+-- column type round-trips with its CRS attached
+DESCRIBE FROM read_parquet('london_aoi.parquet');
+-- expect: geom    GEOMETRY('OGC:CRS84')
+
+SELECT image_id, ST_AsText(geom) AS wkt, ST_CRS(geom) AS crs, length(image_blob) AS bytes
 FROM read_parquet('london_aoi.parquet') LIMIT 5;
+-- expect: wkt = POINT (lon lat), crs = OGC:CRS84
 
 -- confirm GeoParquet 2.0 metadata was emitted
 SELECT decode(value)
 FROM parquet_kv_metadata('london_aoi.parquet')
-WHERE key = 'geo';
--- expect: {"version":"2.0.0","primary_column":"geom",...}
+WHERE decode(key) = 'geo';
+-- expect: {"version":"2.0.0","primary_column":"geom",...,"crs":{...PROJJSON...}}
 
--- confirm native Parquet GEOMETRY logical type
-SELECT geo_types FROM parquet_metadata('london_aoi.parquet');
--- expect: [point]
+-- confirm native Parquet GEOMETRY logical type carries the CRS
+SELECT name, logical_type FROM parquet_schema('london_aoi.parquet') WHERE name = 'geom';
+-- expect: geom    GeometryType(crs={...PROJJSON for OGC:CRS84...})
 ```
 
 ```python
@@ -432,26 +452,39 @@ hnc/
     ├── aoi.py                           # bbox helpers, true-square formula
     ├── mapillary_client.py              # bbox → list[ImageMeta], CDN downloader
     ├── cache.py                         # DuckDB read_parquet anti-join, shard writer
-    ├── frame_to_clip.py                 # JPEG → 4 s 64-frame MP4
+    ├── inference_cache.py               # resumable per-image_id inference shard cache
+    ├── frame_to_clip.py                 # JPEG → 30 s 480-frame MP4 @ 16 fps
     ├── tribe_runner.py                  # TribeModel.from_pretrained + predict
     ├── roi_summary.py                   # summarize_by_roi + top-K HCP aliases
-    ├── geoparquet_writer.py             # final GEOPARQUET_VERSION 'V2' COPY
+    ├── geoparquet_writer.py             # final GEOPARQUET_VERSION 'V2' COPY w/ ST_SetCRS('OGC:CRS84')
     └── pipeline.py                      # orchestration, idempotent, resumable
 
 cache_images/                            # gitignored, synced to HF dataset repo
 ├── cache_part_000000_init.parquet       # one-row sentinel, glob always matches
 ├── cache_part_2026-04-30T13-22-05Z.parquet
 └── ...
-london_aoi.parquet                       # the GeoParquet 2.0 deliverable
+cache_inference/                         # gitignored, per-image_id inference checkpoint
+├── cache_part_000000_init.parquet       # one-row sentinel
+└── cache_part_<ts>.parquet              # brain_activity + top_regions, model_repo audit
+london_aoi.parquet                       # the GeoParquet 2.0 deliverable, GEOMETRY('OGC:CRS84')
 ```
 
 **Tooling.** Python `>=3.11`, package manager **`uv`** (Astral). All dependencies live in `pyproject.toml` under `[project.dependencies]` (core) and `[project.optional-dependencies.tribe]` (heavy ML deps). Standard flow,
 
 ```bash
 cp .env.example .env                     # then fill MAPILLARY_ACCESS_TOKEN
-uv sync --extra tribe                    # creates .venv, resolves + installs everything
+uv sync --all-extras                     # creates .venv, resolves + installs core + tribe + dev
 uv run hnc-run --bbox-name camden --max-images 100
 ```
+
+**Pin notes that matter,**
+
+- `numpy>=2.2,<2.5`, tribev2 hard-pins `numpy==2.2.6`, anything tighter on the floor breaks resolution.
+- `duckdb>=1.5.2,<2`, the v2.0 spatial axis-order default flips and would silently swap lon/lat in `ST_Point`.
+- `tribev2` pinned to commit `72399081ed3f1040c4d996cefb2864a4c46f5b8e`, upstream has no tags and may force-push `main`.
+- `torch>=2.5.1,<2.7`, `torchvision>=0.20,<0.22`, matches tribev2's hard caps.
+- `huggingface_hub>=1.13.0`, mirrored in the `tribe` extra so a future upstream cap can't surprise the resolver.
+- On Blackwell GPUs (sm_120) the default torch wheels miss kernels, see the cu128 reinstall in `notebooks/colab.ipynb` cell 6.
 
 **`.env` keys (normalized, UPPER_SNAKE_CASE).** The legacy "App ID" / "Access Token" with spaces was rewritten to,
 
@@ -477,7 +510,7 @@ flowchart TB
     S3[3, build aoi.py, true-square 300 m bbox at Camden] --> S4
     S4[4, batch download 100 images, end-to-end cache hit/miss working] --> S5
     S5[5, set up TRIBE v2 on Colab L4, run tribe_demo.ipynb unmodified] --> S6
-    S6[6, frame_to_clip, replicate 1 still → 4 s MP4, predict on it] --> S7
+    S6[6, frame_to_clip, replicate 1 still → 30 s 480-frame MP4 @ 16 fps, predict on it] --> S7
     S7[7, summarize_by_roi + top-K alias mapping, sanity check FFA on a face image] --> S8
     S8[8, write GEOPARQUET_VERSION V2 file with 100 rows, validate metadata 2.0.0] --> S9
     S9[9, scale to full 1000-5000 image AOI, sync cache to HF Hub] --> S10
