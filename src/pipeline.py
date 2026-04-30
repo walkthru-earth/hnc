@@ -335,47 +335,99 @@ def run(
         )
 
     n_inferred = 0
-    flush_every = 5
+    flush_every = max(5, 0)
     pending: list[InferenceRow] = []
 
     if to_infer:
         runner = TribeRunner(repo_id=tribe_repo, device=device)
         runner.load()
-        for image_id, blob in tqdm(to_infer, desc="inference", unit="img"):
-            try:
-                with tempfile.TemporaryDirectory(prefix="tribe_clip_") as td:
-                    clip_path = Path(td) / f"{image_id}.mp4"
-                    jpeg_path = Path(td) / f"{image_id}.jpg"
-                    jpeg_path.write_bytes(blob)
-                    jpeg_to_static_clip(blob, clip_path)
-                    preds, _segments = runner.predict_clip(clip_path)
-                collapsed = _safe_collapse(preds)
-                means_dict = _safe_parcel_means_dict(collapsed)
-                top_regions = _safe_top_k(means_dict, k=10)
-                activity_list = [float(x) for x in np.asarray(collapsed, dtype=np.float32).tolist()]
-                _insert_inference_row(
-                    con,
-                    table="inference_results",
-                    image_id=image_id,
-                    brain_activity=np.asarray(collapsed, dtype=np.float32),
-                    top_regions=top_regions,
-                )
-                pending.append(
-                    InferenceRow(
-                        image_id=image_id,
-                        brain_activity=activity_list,
-                        top_regions=top_regions,
-                        inferred_at=datetime.now(UTC).replace(tzinfo=None),
-                        model_repo=tribe_repo,
+        chunk_size = max(1, runner.batch_size)
+        logger.info(
+            "inference batched device=%s chunk_size=%d total=%d",
+            runner.device,
+            chunk_size,
+            len(to_infer),
+        )
+        for chunk_start in tqdm(
+            range(0, len(to_infer), chunk_size), desc="inference", unit="chunk"
+        ):
+            chunk = to_infer[chunk_start : chunk_start + chunk_size]
+            with tempfile.TemporaryDirectory(prefix="tribe_clip_") as td:
+                td_path = Path(td)
+                items: list[tuple[str, Path]] = []
+                encoded_blobs: dict[str, bytes] = {}
+                for image_id, blob in chunk:
+                    try:
+                        clip_path = td_path / f"{image_id}.mp4"
+                        jpeg_to_static_clip(blob, clip_path)
+                        items.append((image_id, clip_path))
+                        encoded_blobs[image_id] = blob
+                    except Exception as exc:
+                        logger.warning(
+                            "encode failed image_id=%s err=%s", image_id, exc
+                        )
+                        continue
+                if not items:
+                    continue
+                try:
+                    preds_by_id = runner.predict_clips(items)
+                except Exception as exc:
+                    logger.warning(
+                        "inference batch failed n=%d err=%s, falling back to per-clip",
+                        len(items),
+                        exc,
                     )
-                )
-                n_inferred += 1
-                if len(pending) >= flush_every:
-                    write_inference_shard(pending)
-                    pending = []
-            except Exception as exc:
-                logger.warning("inference failed image_id=%s err=%s", image_id, exc)
-                continue
+                    preds_by_id = {}
+                    for image_id, clip_path in items:
+                        try:
+                            single = runner.predict_clips([(image_id, clip_path)])
+                            preds_by_id.update(single)
+                        except Exception as exc_inner:
+                            logger.warning(
+                                "inference failed image_id=%s err=%s",
+                                image_id,
+                                exc_inner,
+                            )
+                for image_id, _clip_path in items:
+                    preds = preds_by_id.get(image_id)
+                    if preds is None or preds.size == 0:
+                        logger.warning(
+                            "inference no segments image_id=%s", image_id
+                        )
+                        continue
+                    try:
+                        collapsed = _safe_collapse(preds)
+                        means_dict = _safe_parcel_means_dict(collapsed)
+                        top_regions = _safe_top_k(means_dict, k=10)
+                        activity_list = [
+                            float(x)
+                            for x in np.asarray(collapsed, dtype=np.float32).tolist()
+                        ]
+                        _insert_inference_row(
+                            con,
+                            table="inference_results",
+                            image_id=image_id,
+                            brain_activity=np.asarray(collapsed, dtype=np.float32),
+                            top_regions=top_regions,
+                        )
+                        pending.append(
+                            InferenceRow(
+                                image_id=image_id,
+                                brain_activity=activity_list,
+                                top_regions=top_regions,
+                                inferred_at=datetime.now(UTC).replace(tzinfo=None),
+                                model_repo=tribe_repo,
+                            )
+                        )
+                        n_inferred += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "post-process failed image_id=%s err=%s", image_id, exc
+                        )
+                        continue
+            if len(pending) >= flush_every:
+                write_inference_shard(pending)
+                pending = []
         if pending:
             write_inference_shard(pending)
             pending = []
