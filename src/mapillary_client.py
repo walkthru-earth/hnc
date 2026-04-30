@@ -107,22 +107,56 @@ class MapillaryClient:
         end_captured_at: datetime | None = None,
         is_pano: bool | None = False,
         limit: int = 2000,
+        page_size: int = 2000,
     ) -> list[ImageMeta]:
+        """Paginate Mapillary /images, following paging.next until limit or end.
+
+        `limit` is the total cap across all pages. `page_size` is per-request
+        (Mapillary docs cap this at 2000). The Mapillary spatial index also
+        leaks rows whose computed_geometry lies just outside the requested
+        bbox, callers should still re-check lon/lat against `bbox`.
+        """
         bbox.assert_under_mapillary_limit()
-        params: dict[str, str | int] = {
+        per_page = min(page_size, max(1, limit))
+        first_params: dict[str, str | int] = {
             "bbox": bbox.as_mapillary_str(),
             "fields": DEFAULT_FIELDS,
-            "limit": limit,
+            "limit": per_page,
         }
         if start_captured_at is not None:
-            params["start_captured_at"] = _to_iso_z(start_captured_at)
+            first_params["start_captured_at"] = _to_iso_z(start_captured_at)
         if end_captured_at is not None:
-            params["end_captured_at"] = _to_iso_z(end_captured_at)
+            first_params["end_captured_at"] = _to_iso_z(end_captured_at)
 
-        resp = self._request_with_retry("GET", GRAPH_URL, params=params)
-        payload = resp.json()
-        rows = payload.get("data", []) or []
+        out: list[ImageMeta] = []
+        url: str = GRAPH_URL
+        params: dict[str, str | int] | None = first_params
 
+        while True:
+            if params is not None:
+                resp = self._request_with_retry("GET", url, params=params)
+            else:
+                # paging.next is a fully-qualified URL with the cursor baked in,
+                # do not pass params or the cursor will be dropped.
+                resp = self._request_with_retry("GET", url)
+            payload = resp.json()
+            rows = payload.get("data", []) or []
+            out.extend(self._parse_image_rows(rows, is_pano=is_pano))
+            if len(out) >= limit:
+                return out[:limit]
+
+            paging = payload.get("paging") or {}
+            next_url = paging.get("next") if isinstance(paging, dict) else None
+            if not next_url:
+                return out
+
+            url = next_url
+            params = None
+
+    @staticmethod
+    def _parse_image_rows(
+        rows: list[dict[str, object]], *, is_pano: bool | None
+    ) -> list[ImageMeta]:
         out: list[ImageMeta] = []
         for r in rows:
             geom = r.get("computed_geometry") or {}
