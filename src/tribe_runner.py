@@ -39,10 +39,6 @@ class TribeRunner:
             self.repo_id,
             cache_folder=self.cache_folder,
             device=self.device,
-            config_update={
-                "average_subjects": True,
-                "features_to_use": ["video"],
-            },
         )
 
     def predict_clip(self, video_path: Path) -> tuple[np.ndarray, list]:
