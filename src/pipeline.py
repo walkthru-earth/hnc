@@ -288,6 +288,16 @@ def run(
     counts["inferred"] = n_inferred
     timings["inference_s"] = time.monotonic() - t0
 
+    if n_inferred == 0:
+        raise RuntimeError(
+            f"All {len(working)} inference attempts failed. The deliverable would be "
+            "empty and the GeoParquet write would not emit valid geometry metadata. "
+            "Check the per-image warnings above. On Blackwell GPUs (sm_120), the "
+            "default torch wheels lack matching kernels, install the cu128 build into "
+            ".venv with `uv pip install -p .venv/bin/python --reinstall "
+            "--index-url https://download.pytorch.org/whl/cu128 torch torchvision`."
+        )
+
     # 8. (inference_results is already populated above)
 
     # 9. Write deliverable.
