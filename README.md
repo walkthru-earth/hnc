@@ -20,7 +20,13 @@ graph LR
 
 One row per image with `image_blob`, `image_id`, `lon`, `lat`, `compass_angle`, `captured_at`, `geom` (native Parquet GEOMETRY logical type), and a fixed-length array of 20484 cortical vertex activations on the fsaverage5 mesh, summarized to 360 HCP MMP1 parcels plus a small set of functional ROI aliases (FFA, PPA, EBA, V1, MT, and similar).
 
-## Setup
+## Run on Google Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/walkthru-earth/hnc/blob/main/notebooks/colab.ipynb)
+
+Pick an L4 GPU runtime, add `MAPILLARY_ACCESS_TOKEN` and `HF_TOKEN` to Colab Secrets, then run all cells. See [notebooks/colab.ipynb](notebooks/colab.ipynb).
+
+## Setup (local)
 
 ```bash
 uv sync
