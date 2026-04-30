@@ -343,9 +343,11 @@ def run(
 
     if to_infer:
         autocast_dtype: str | None
-        if autocast == "auto":
-            autocast_dtype = "bfloat16"
-        elif autocast in ("off", "none", "fp32", "float32"):
+        # TRIBE v2's predict() calls .detach().cpu().numpy() on intermediate
+        # tensors, and numpy refuses bfloat16 ("Got unsupported ScalarType
+        # BFloat16"). fp16 has the same issue. Default autocast OFF, callers
+        # can opt in once they verify their tribev2 build is bf16-clean.
+        if autocast in ("auto", "off", "none", "fp32", "float32"):
             autocast_dtype = None
         elif autocast in ("bf16", "bfloat16"):
             autocast_dtype = "bfloat16"
@@ -353,9 +355,9 @@ def run(
             autocast_dtype = "float16"
         else:
             logger.warning(
-                "unknown autocast=%r, falling back to bfloat16", autocast
+                "unknown autocast=%r, disabling autocast", autocast
             )
-            autocast_dtype = "bfloat16"
+            autocast_dtype = None
         runner = TribeRunner(
             repo_id=tribe_repo,
             device=device,
@@ -395,22 +397,62 @@ def run(
                 try:
                     preds_by_id = runner.predict_clips(items)
                 except Exception as exc:
-                    logger.warning(
-                        "inference batch failed n=%d err=%s, falling back to per-clip",
-                        len(items),
-                        exc,
-                    )
-                    preds_by_id = {}
-                    for image_id, clip_path in items:
+                    err_text = str(exc)
+                    # TRIBE's numpy() conversion can't accept bf16/fp16. If
+                    # autocast is on and we hit that, disable it for the rest
+                    # of the run instead of bleeding a fallback per clip that
+                    # also fails. Same scalar-type error appears for fp16.
+                    if (
+                        runner.autocast_dtype is not None
+                        and "ScalarType" in err_text
+                    ):
+                        logger.warning(
+                            "inference batch failed n=%d err=%s, "
+                            "disabling autocast for the rest of the run",
+                            len(items),
+                            exc,
+                        )
+                        runner.autocast_dtype = None
                         try:
-                            single = runner.predict_clips([(image_id, clip_path)])
-                            preds_by_id.update(single)
-                        except Exception as exc_inner:
+                            preds_by_id = runner.predict_clips(items)
+                        except Exception as exc_retry:
                             logger.warning(
-                                "inference failed image_id=%s err=%s",
-                                image_id,
-                                exc_inner,
+                                "inference batch retry failed n=%d err=%s, "
+                                "falling back to per-clip",
+                                len(items),
+                                exc_retry,
                             )
+                            preds_by_id = {}
+                            for image_id, clip_path in items:
+                                try:
+                                    single = runner.predict_clips(
+                                        [(image_id, clip_path)]
+                                    )
+                                    preds_by_id.update(single)
+                                except Exception as exc_inner:
+                                    logger.warning(
+                                        "inference failed image_id=%s err=%s",
+                                        image_id,
+                                        exc_inner,
+                                    )
+                    else:
+                        logger.warning(
+                            "inference batch failed n=%d err=%s, "
+                            "falling back to per-clip",
+                            len(items),
+                            exc,
+                        )
+                        preds_by_id = {}
+                        for image_id, clip_path in items:
+                            try:
+                                single = runner.predict_clips([(image_id, clip_path)])
+                                preds_by_id.update(single)
+                            except Exception as exc_inner:
+                                logger.warning(
+                                    "inference failed image_id=%s err=%s",
+                                    image_id,
+                                    exc_inner,
+                                )
                 for image_id, _clip_path in items:
                     preds = preds_by_id.get(image_id)
                     if preds is None or preds.size == 0:
@@ -523,10 +565,12 @@ def main(
         help="Override TRIBE inference batch size, default auto-picks from VRAM",
     ),
     autocast: str = typer.Option(
-        "auto",
+        "off",
         "--autocast",
-        help="Mixed-precision mode for the forward pass, "
-        "'auto' | 'bf16' | 'fp16' | 'off' (cuda only)",
+        help="Mixed-precision mode for the forward pass. Default 'off' "
+        "because TRIBE's predict() calls .numpy() on intermediate tensors "
+        "and bf16/fp16 raise 'Got unsupported ScalarType'. "
+        "'off' | 'bf16' | 'fp16' (cuda only, opt-in once verified)",
     ),
     num_workers: int | None = typer.Option(
         None,

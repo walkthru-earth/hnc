@@ -80,7 +80,7 @@ class TribeRunner:
         device: str = "auto",
         batch_size: int | None = None,
         num_workers: int | None = None,
-        autocast_dtype: str | None = "bfloat16",
+        autocast_dtype: str | None = None,
     ) -> None:
         self.repo_id = repo_id
         self.cache_folder = cache_folder
