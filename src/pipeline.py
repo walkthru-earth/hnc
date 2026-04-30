@@ -191,6 +191,9 @@ def run(
     out: Path = Path("london_aoi.parquet"),
     tribe_repo: str = "facebook/tribev2",
     device: str = "auto",
+    batch_size: int | None = None,
+    autocast: str = "auto",
+    num_workers: int | None = None,
 ) -> dict[str, Any]:
     _setup_logging()
     timings: dict[str, float] = {}
@@ -339,7 +342,27 @@ def run(
     pending: list[InferenceRow] = []
 
     if to_infer:
-        runner = TribeRunner(repo_id=tribe_repo, device=device)
+        autocast_dtype: str | None
+        if autocast == "auto":
+            autocast_dtype = "bfloat16"
+        elif autocast in ("off", "none", "fp32", "float32"):
+            autocast_dtype = None
+        elif autocast in ("bf16", "bfloat16"):
+            autocast_dtype = "bfloat16"
+        elif autocast in ("fp16", "float16"):
+            autocast_dtype = "float16"
+        else:
+            logger.warning(
+                "unknown autocast=%r, falling back to bfloat16", autocast
+            )
+            autocast_dtype = "bfloat16"
+        runner = TribeRunner(
+            repo_id=tribe_repo,
+            device=device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            autocast_dtype=autocast_dtype,
+        )
         runner.load()
         chunk_size = max(1, runner.batch_size)
         logger.info(
@@ -494,6 +517,22 @@ def main(
     out: Path = typer.Option(Path("london_aoi.parquet"), help="Output GeoParquet 2.0 path"),
     tribe_repo: str = typer.Option("facebook/tribev2", help="HF repo id for TRIBE v2 weights"),
     device: str = typer.Option("auto", help="Torch device, 'auto' | 'cpu' | 'mps' | 'cuda'"),
+    batch_size: int | None = typer.Option(
+        None,
+        "--batch-size",
+        help="Override TRIBE inference batch size, default auto-picks from VRAM",
+    ),
+    autocast: str = typer.Option(
+        "auto",
+        "--autocast",
+        help="Mixed-precision mode for the forward pass, "
+        "'auto' | 'bf16' | 'fp16' | 'off' (cuda only)",
+    ),
+    num_workers: int | None = typer.Option(
+        None,
+        "--num-workers",
+        help="Override DataLoader num_workers, default 4 on cuda, 0 elsewhere",
+    ),
 ) -> None:
     run(
         bbox_name=bbox_name,
@@ -505,6 +544,9 @@ def main(
         out=out,
         tribe_repo=tribe_repo,
         device=device,
+        batch_size=batch_size,
+        autocast=autocast,
+        num_workers=num_workers,
     )
 
 
