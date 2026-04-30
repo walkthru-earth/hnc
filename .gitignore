@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.local
+*.parquet
+cache_images/
+tribe_cache/
+*.mp4
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# scratch / research, not for the public repo
+draft.md
+docs/*.pdf
+out/
