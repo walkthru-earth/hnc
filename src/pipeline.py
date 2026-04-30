@@ -143,9 +143,14 @@ def _materialise_working_set(
     con: duckdb.DuckDBPyConnection,
     *,
     cache_glob: str,
-    bbox: BBox,
     candidate_ids: list[str],
 ) -> list[tuple[str, bytes]]:
+    """Pull the freshly-cached blobs for `candidate_ids` and log any drop.
+
+    Bbox pre-filtering happens upstream in the pipeline, here we only refuse
+    rows that are missing from cache or have a NULL blob. Both situations are
+    bugs we want loud, so log each dropped image_id.
+    """
     if not candidate_ids:
         return []
     placeholders = ", ".join(["?"] * len(candidate_ids))
@@ -154,12 +159,26 @@ def _materialise_working_set(
         FROM read_parquet('{cache_glob}', union_by_name=true)
         WHERE image_id <> '__sentinel__'
           AND image_id IN ({placeholders})
-          AND lon BETWEEN {bbox.west} AND {bbox.east}
-          AND lat BETWEEN {bbox.south} AND {bbox.north}
-          AND image_blob IS NOT NULL
     """
     rows = con.execute(sql, candidate_ids).fetchall()
-    return [(str(r[0]), bytes(r[1])) for r in rows if r[1] is not None]
+    by_id: dict[str, bytes | None] = {}
+    for r in rows:
+        iid = str(r[0])
+        blob = bytes(r[1]) if r[1] is not None else None
+        # Last write wins, dedup is fine since image_blob is content-addressed.
+        by_id[iid] = blob
+
+    out: list[tuple[str, bytes]] = []
+    for iid in candidate_ids:
+        if iid not in by_id:
+            logger.warning("materialise drop image_id=%s reason=not_in_cache", iid)
+            continue
+        blob = by_id[iid]
+        if blob is None:
+            logger.warning("materialise drop image_id=%s reason=null_blob", iid)
+            continue
+        out.append((iid, blob))
+    return out
 
 
 def run(
@@ -222,18 +241,40 @@ def run(
     t0 = time.monotonic()
     start_dt = _parse_start_captured(start_captured_at)
     with MapillaryClient() as mly:
-        metas = mly.list_images_in_bbox(
+        api_limit = max_images if max_images > 0 else 2000
+        raw_metas = mly.list_images_in_bbox(
             bbox,
             start_captured_at=start_dt,
             is_pano=False,
-            limit=min(max_images if max_images > 0 else 2000, 2000),
+            limit=api_limit,
         )
+        # Mapillary's spatial index leaks rows whose computed_geometry sits
+        # just outside the requested bbox, drop them now so we don't waste
+        # bytes downloading images that won't be in the deliverable.
+        metas = []
+        for m in raw_metas:
+            if (
+                bbox.west <= m.lon <= bbox.east
+                and bbox.south <= m.lat <= bbox.north
+            ):
+                metas.append(m)
+            else:
+                logger.warning(
+                    "mapillary drop image_id=%s reason=out_of_bbox lon=%.6f lat=%.6f",
+                    m.image_id,
+                    m.lon,
+                    m.lat,
+                )
         if max_images > 0:
             metas = metas[:max_images]
         counts["candidates"] = len(metas)
         candidate_ids = [m.image_id for m in metas]
         logger.info(
-            "mapillary candidates=%d (after is_pano=False, max_images=%d)", len(metas), max_images
+            "mapillary candidates=%d (after is_pano=False + bbox-recheck, "
+            "raw=%d, max_images=%d)",
+            len(metas),
+            len(raw_metas),
+            max_images,
         )
         timings["mapillary_query_s"] = time.monotonic() - t0
 
@@ -273,7 +314,7 @@ def run(
     con.execute("INSTALL spatial; LOAD spatial;")
     cache_glob = "cache_images/cache_part_*.parquet"
     working = _materialise_working_set(
-        con, cache_glob=cache_glob, bbox=bbox, candidate_ids=candidate_ids
+        con, cache_glob=cache_glob, candidate_ids=candidate_ids
     )
     logger.info("working set rows=%d", len(working))
     timings["materialise_s"] = time.monotonic() - t0
