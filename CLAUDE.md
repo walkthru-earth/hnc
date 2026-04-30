@@ -82,6 +82,14 @@ keeps re-runs cheap when the model output for an image already exists.
 - Any silent filter is a bug. `_materialise_working_set` logs every dropped
   image_id with a reason (`not_in_cache` / `null_blob`), the download loop
   logs every failed `image_id`, the inference loop logs every TRIBE failure.
+- Inference is **batched and adaptive**. `TribeRunner` auto-picks
+  `batch_size` from VRAM (T4 16 GB → 1, L4 24 GB → 4, A100 40 GB → 12,
+  A100 80 GB / H100 80 GB → 24) and wraps the forward pass in
+  `torch.autocast(bfloat16)` on CUDA. The pipeline groups clips into chunks
+  of `runner.batch_size`, encodes each chunk's MP4s into one tempdir, and
+  calls `runner.predict_clips()` once per chunk so V-JEPA2 ViT-G actually
+  fills the GPU. A failed batch falls back to per-clip inference so one bad
+  image doesn't kill the whole chunk.
 - Run `uv sync --all-extras` to set up; `uv run pytest` and `uv run ruff check .`
   to verify before committing.
 
