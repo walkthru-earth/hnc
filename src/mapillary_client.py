@@ -14,7 +14,7 @@ from .aoi import BBox
 GRAPH_URL = "https://graph.mapillary.com/images"
 DEFAULT_FIELDS = (
     "id,captured_at,computed_geometry,computed_compass_angle,"
-    "camera_type,is_pano,sequence,creator_id,width,height,thumb_2048_url"
+    "camera_type,is_pano,sequence,creator,width,height,thumb_2048_url"
 )
 MAX_RETRIES = 5
 BACKOFF_BASE_S = 1.0
@@ -148,6 +148,14 @@ class MapillaryClient:
             url = r.get("thumb_2048_url")
             if not url:
                 continue
+            # Per Mapillary docs the Image entity exposes creator{id,username},
+            # not a flat creator_id. Older sequence-search responses included
+            # creator_id directly, so we tolerate both.
+            creator_field = r.get("creator")
+            if isinstance(creator_field, dict):
+                creator_id_raw: object = creator_field.get("id")
+            else:
+                creator_id_raw = r.get("creator_id")
             out.append(
                 ImageMeta(
                     image_id=str(r["id"]),
@@ -162,7 +170,7 @@ class MapillaryClient:
                     camera_type=r.get("camera_type"),
                     is_pano=row_is_pano,
                     sequence_id=sequence_id,
-                    creator_id=(int(r["creator_id"]) if r.get("creator_id") is not None else None),
+                    creator_id=(int(creator_id_raw) if creator_id_raw is not None else None),
                     width=(int(r["width"]) if r.get("width") is not None else None),
                     height=(int(r["height"]) if r.get("height") is not None else None),
                     thumb_2048_url=url,
