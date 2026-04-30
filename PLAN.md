@@ -118,10 +118,11 @@ curl -G "https://graph.mapillary.com/images" \
 Hard limits to respect,
 
 - Max bbox area `0.01` square degrees (~1.1 km × 1.1 km near the equator). Larger fails, tile the AOI yourself.
-- `limit` max **2000** per call. For more, sub-tile the bbox.
+- `limit` max **2000** per page. The client now follows `paging.next` until either the caller's total cap is reached or the server runs out, so `--max-images 5000` works without sub-tiling.
 - Search rate, **10,000 calls / minute**. Entity rate, **60,000 / minute**.
 - Filter `is_pano=false` to drop equirectangular frames, the model expects pinhole perspective.
 - Prefer `computed_geometry` and `computed_compass_angle` over `geometry` / `compass_angle` (SfM-corrected).
+- **Bbox leak**, the `/images` spatial index returns rows whose `computed_geometry` sits a few tens of meters outside the requested bbox (we observed a 76 m violation on the Borough Market AOI). The pipeline re-checks `lon`/`lat` against the bbox right after the API call and logs each `out_of_bbox` drop, so out-of-AOI frames never enter the cache.
 
 **Image bytes**, `thumb_2048_url` returns a pre-signed Meta CDN URL, fetch it without an `Authorization` header (sending one can 403). Treat URLs as ephemeral, do not cache them, re-resolve from `/images` when re-downloading.
 
@@ -526,6 +527,7 @@ flowchart TB
 - **Llama 3.2 gating.** If we ever want the text branch, the user must accept the Meta Llama Community License on HF. Vision-only mode sidesteps this entirely.
 - **CC-BY-NC-4.0.** The deliverable parquet inherits the model's non-commercial constraint, monetisation is not allowed. Attribute d'Ascoli et al., 2026.
 - **Mapillary CDN URL freshness.** Signed URLs expire, do not store URLs in the cache, only the resolved image bytes.
+- **Mapillary bbox spatial-index slop.** Confirmed 76 m violation in a Borough Market run (1 of 5 candidates fell outside the requested bbox). Mitigation lives in `pipeline.py`: every candidate is re-checked against the bbox before download, and `_materialise_working_set` logs every dropped image_id with a reason (`out_of_bbox` / `not_in_cache` / `null_blob`) so a 5-to-4 row collapse can never again happen silently.
 - **MPS quirks on Apple Silicon.** Set `PYTORCH_ENABLE_MPS_FALLBACK=1`, expect occasional silent CPU bounces. If MPS misbehaves on the fusion transformer, fall back to bf16 CPU on M3 Pro at ~0.1-0.2 img/s, painful for 5000 but fine for a 200-image smoke test.
 - **GeoParquet 2.0 reader compatibility.** As of 2026-04, native Parquet `GEOMETRY` logical type plus 2.0.0 metadata is read by DuckDB 1.5+, libarrow trunk, and recent GeoPandas, older readers (GeoPandas <1.1, GDAL <3.13) may need the `'BOTH'` mode (1.0 metadata + native type) for compatibility. The plan defaults to `'V2'`, switch to `'BOTH'` if downstream consumers complain.
 

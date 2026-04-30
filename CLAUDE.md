@@ -73,6 +73,15 @@ keeps re-runs cheap when the model output for an image already exists.
 - Always use `ST_SetCRS(ST_Point(lon, lat), 'OGC:CRS84')` for the deliverable
   geometry column. `SET geometry_always_xy = true` on any spatial session.
 - Lon/lat order. Always. `ST_Point(lon, lat)`, never `(lat, lon)`.
+- `MapillaryClient.list_images_in_bbox` follows `paging.next` until either the
+  caller's total `limit` is reached or the server runs out, so `--max-images`
+  is a real total cap, not a per-page cap.
+- Mapillary's bbox spatial index leaks rows up to ~75 m outside the requested
+  bbox. The pipeline re-checks `lon`/`lat` immediately after the API call and
+  logs each `out_of_bbox` drop, so out-of-AOI frames never enter the cache.
+- Any silent filter is a bug. `_materialise_working_set` logs every dropped
+  image_id with a reason (`not_in_cache` / `null_blob`), the download loop
+  logs every failed `image_id`, the inference loop logs every TRIBE failure.
 - Run `uv sync --all-extras` to set up; `uv run pytest` and `uv run ruff check .`
   to verify before committing.
 
