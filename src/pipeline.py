@@ -79,22 +79,27 @@ def _safe_collapse(preds: np.ndarray) -> np.ndarray:
     return _collapse_segments(preds)
 
 
-def _safe_parcel_means(vertex_vec: np.ndarray) -> np.ndarray:
+def _safe_parcel_means_dict(vertex_vec: np.ndarray) -> dict[str, float]:
     from . import roi_summary
 
     fn = getattr(roi_summary, "parcel_means", None)
     if not callable(fn):
         raise RuntimeError("roi_summary.parcel_means not available")
-    return np.asarray(fn(vertex_vec), dtype=np.float32)
+    raw = fn(vertex_vec)
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"roi_summary.parcel_means must return dict[str, float], got {type(raw).__name__}"
+        )
+    return {str(k): float(v) for k, v in raw.items()}
 
 
-def _safe_top_k(parcel_vec: np.ndarray, k: int = 10) -> list[dict[str, Any]]:
+def _safe_top_k(means: dict[str, float], k: int = 10) -> list[dict[str, Any]]:
     from . import roi_summary
 
     fn = getattr(roi_summary, "top_k_aliases", None)
     if not callable(fn):
         raise RuntimeError("roi_summary.top_k_aliases not available")
-    raw = fn(parcel_vec, k=k)
+    raw = fn(means, k=k)
     out: list[dict[str, Any]] = []
     for item in raw:
         if isinstance(item, dict) and "name" in item and "score" in item:
@@ -174,6 +179,7 @@ def run(
         "candidates": 0,
         "cached": 0,
         "downloaded": 0,
+        "inference_cache_hit": 0,
         "inferred": 0,
         "written": 0,
     }
@@ -182,6 +188,21 @@ def run(
     from .cache import build_cache_row, ensure_sentinel, filter_new, write_shard
     from .frame_to_clip import jpeg_to_static_clip
     from .geoparquet_writer import verify_geoparquet_v2, write_geoparquet_v2
+    from .inference_cache import (
+        InferenceRow,
+    )
+    from .inference_cache import (
+        cached_ids as inference_cached_ids,
+    )
+    from .inference_cache import (
+        ensure_sentinel as ensure_inference_sentinel,
+    )
+    from .inference_cache import (
+        load_into_table as load_inference_into_table,
+    )
+    from .inference_cache import (
+        write_shard as write_inference_shard,
+    )
     from .mapillary_client import MapillaryClient
     from .tribe_runner import TribeRunner
 
@@ -257,44 +278,78 @@ def run(
     logger.info("working set rows=%d", len(working))
     timings["materialise_s"] = time.monotonic() - t0
 
-    # 7. Inference.
+    # 7. Inference, with on-disk checkpoint cache so a re-run skips images
+    # whose brain_activity is already persisted.
     t0 = time.monotonic()
-    runner = TribeRunner(repo_id=tribe_repo, device=device)
-    runner.load()
     _create_inference_table(con)
+    ensure_inference_sentinel()
+    working_ids = [iid for iid, _ in working]
+    already_inferred = inference_cached_ids(con) & set(working_ids)
+    to_infer = [(iid, blob) for iid, blob in working if iid not in already_inferred]
+    counts["inference_cache_hit"] = len(already_inferred)
+    logger.info("inference cache_hit=%d cache_miss=%d", len(already_inferred), len(to_infer))
+    if already_inferred:
+        load_inference_into_table(
+            con, table="inference_results", image_ids=sorted(already_inferred)
+        )
+
     n_inferred = 0
-    for image_id, blob in tqdm(working, desc="inference", unit="img"):
-        try:
-            with tempfile.TemporaryDirectory(prefix="tribe_clip_") as td:
-                clip_path = Path(td) / f"{image_id}.mp4"
-                jpeg_path = Path(td) / f"{image_id}.jpg"
-                jpeg_path.write_bytes(blob)
-                jpeg_to_static_clip(blob, clip_path)
-                preds, _segments = runner.predict_clip(clip_path)
-            collapsed = _safe_collapse(preds)
-            parcel_vec = _safe_parcel_means(collapsed)
-            top_regions = _safe_top_k(parcel_vec, k=10)
-            _insert_inference_row(
-                con,
-                table="inference_results",
-                image_id=image_id,
-                brain_activity=parcel_vec,
-                top_regions=top_regions,
-            )
-            n_inferred += 1
-        except Exception as exc:
-            logger.warning("inference failed image_id=%s err=%s", image_id, exc)
-            continue
+    flush_every = 5
+    pending: list[InferenceRow] = []
+
+    if to_infer:
+        runner = TribeRunner(repo_id=tribe_repo, device=device)
+        runner.load()
+        for image_id, blob in tqdm(to_infer, desc="inference", unit="img"):
+            try:
+                with tempfile.TemporaryDirectory(prefix="tribe_clip_") as td:
+                    clip_path = Path(td) / f"{image_id}.mp4"
+                    jpeg_path = Path(td) / f"{image_id}.jpg"
+                    jpeg_path.write_bytes(blob)
+                    jpeg_to_static_clip(blob, clip_path)
+                    preds, _segments = runner.predict_clip(clip_path)
+                collapsed = _safe_collapse(preds)
+                means_dict = _safe_parcel_means_dict(collapsed)
+                top_regions = _safe_top_k(means_dict, k=10)
+                activity_list = [float(x) for x in np.asarray(collapsed, dtype=np.float32).tolist()]
+                _insert_inference_row(
+                    con,
+                    table="inference_results",
+                    image_id=image_id,
+                    brain_activity=np.asarray(collapsed, dtype=np.float32),
+                    top_regions=top_regions,
+                )
+                pending.append(
+                    InferenceRow(
+                        image_id=image_id,
+                        brain_activity=activity_list,
+                        top_regions=top_regions,
+                        inferred_at=datetime.now(UTC).replace(tzinfo=None),
+                        model_repo=tribe_repo,
+                    )
+                )
+                n_inferred += 1
+                if len(pending) >= flush_every:
+                    write_inference_shard(pending)
+                    pending = []
+            except Exception as exc:
+                logger.warning("inference failed image_id=%s err=%s", image_id, exc)
+                continue
+        if pending:
+            write_inference_shard(pending)
+            pending = []
+
     counts["inferred"] = n_inferred
     timings["inference_s"] = time.monotonic() - t0
 
-    if n_inferred == 0:
+    if (n_inferred + len(already_inferred)) == 0:
         raise RuntimeError(
-            f"All {len(working)} inference attempts failed. The deliverable would be "
-            "empty and the GeoParquet write would not emit valid geometry metadata. "
-            "Check the per-image warnings above. On Blackwell GPUs (sm_120), the "
-            "default torch wheels lack matching kernels, install the cu128 build into "
-            ".venv with `uv pip install -p .venv/bin/python --reinstall "
+            f"All {len(working)} inference attempts failed and no cached inference "
+            "results matched. The deliverable would be empty and the GeoParquet "
+            "write would not emit valid geometry metadata. Check the per-image "
+            "warnings above. On Blackwell GPUs (sm_120), the default torch wheels "
+            "lack matching kernels, install the cu128 build into .venv with "
+            "`uv pip install -p .venv/bin/python --reinstall "
             "--index-url https://download.pytorch.org/whl/cu128 torch torchvision`."
         )
 
@@ -323,7 +378,9 @@ def run(
     summary = {"counts": counts, "timings_s": timings, "out": out_path.as_posix(), "verify": verify}
     print(
         f"summary: candidates={counts['candidates']} cached={counts['cached']} "
-        f"downloaded={counts['downloaded']} inferred={counts['inferred']} written={counts['written']} "
+        f"downloaded={counts['downloaded']} "
+        f"inference_cache_hit={counts['inference_cache_hit']} "
+        f"inferred={counts['inferred']} written={counts['written']} "
         f"timings={ {k: round(v, 2) for k, v in timings.items()} } out={out_path.as_posix()}"
     )
     return summary

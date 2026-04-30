@@ -46,12 +46,18 @@ def parcel_means(preds_row: np.ndarray) -> dict[str, float]:
 
 
 def alias_scores(
-    preds_row: np.ndarray,
+    preds_row: np.ndarray | dict[str, float],
     alias_map: dict[str, list[str]] = HCP_ALIAS_GLOBS,
 ) -> dict[str, float]:
     import fnmatch
 
-    means = parcel_means(preds_row)
+    # Accept either a vertex vector (which we summarise) or a pre-computed
+    # parcel-mean dict. Re-summarising a dict produces nonsense, and
+    # tribev2.utils.summarize_by_roi rejects non-vertex shapes outright.
+    if isinstance(preds_row, dict):
+        means = {str(k): float(v) for k, v in preds_row.items()}
+    else:
+        means = parcel_means(preds_row)
     parcel_names = list(means.keys())
     out: dict[str, float] = {}
     for alias, globs in alias_map.items():
@@ -68,7 +74,7 @@ def alias_scores(
     return out
 
 
-def top_k_aliases(preds_row: np.ndarray, k: int = 8) -> list[dict]:
+def top_k_aliases(preds_row: np.ndarray | dict[str, float], k: int = 8) -> list[dict]:
     scores = alias_scores(preds_row)
     pairs = [(name, score) for name, score in scores.items() if not np.isnan(score)]
     pairs.sort(key=lambda kv: kv[1], reverse=True)

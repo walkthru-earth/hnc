@@ -5,6 +5,7 @@ __pycache__/
 .env.local
 *.parquet
 cache_images/
+cache_inference/
 tribe_cache/
 *.mp4
 .DS_Store
