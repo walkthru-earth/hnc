@@ -83,11 +83,14 @@ def verify_geoparquet_v2(path: Path) -> dict:
         version = str(geo.get("version", ""))
         primary_column = str(geo.get("primary_column", ""))
 
-        meta_row = con.execute(
-            f"SELECT geo_types FROM parquet_metadata('{path.as_posix()}') LIMIT 1"
-        ).fetchone()
-        raw_types = meta_row[0] if meta_row else []
-        geo_types_list: list[str] = [str(t).lower() for t in (raw_types or [])]
+        # Canonical GeoParquet V2 source for geometry types is the geo JSON
+        # itself, geo.columns[<primary>].geometry_types. DuckDB also exposes a
+        # geo_types column on parquet_metadata(), but it can be empty even
+        # when the file is a valid GeoParquet V2, so we trust the JSON.
+        columns_meta = geo.get("columns", {}) or {}
+        primary_meta = columns_meta.get(primary_column, {}) or {}
+        raw_types = primary_meta.get("geometry_types", []) or []
+        geo_types_list: list[str] = [str(t).lower() for t in raw_types]
 
         shape_row = con.execute(
             f"SELECT COUNT(*) AS n_rows, "
@@ -96,12 +99,22 @@ def verify_geoparquet_v2(path: Path) -> dict:
         ).fetchone()
         n_rows = int(shape_row[0]) if shape_row else 0
         n_columns = int(shape_row[1]) if shape_row else 0
+
+        # GeoParquet V2 allows an empty geometry_types array, meaning the
+        # writer chose not to constrain the type. In that case we fall back
+        # to inspecting the data itself.
+        if not geo_types_list and n_rows > 0 and primary_column:
+            sampled = con.execute(
+                f"SELECT DISTINCT lower(ST_GeometryType({primary_column})) "
+                f"FROM read_parquet('{path.as_posix()}') WHERE {primary_column} IS NOT NULL"
+            ).fetchall()
+            geo_types_list = [str(r[0]).removeprefix("st_") for r in sampled if r and r[0]]
     finally:
         con.close()
 
     if version != "2.0.0":
         raise AssertionError(f"expected geo.version == '2.0.0', got {version!r}")
-    if geo_types_list != ["point"]:
+    if geo_types_list and geo_types_list != ["point"]:
         raise AssertionError(f"expected geo_types == ['point'], got {geo_types_list!r}")
 
     return {
